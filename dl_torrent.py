@@ -7,9 +7,169 @@ import os
 import sys
 import random
 import urllib.parse
-import urllib.request
 from typing import List, Optional, Tuple, Set
 import bencodepy
+from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn, TimeRemainingColumn, FileSizeColumn, TotalFileSizeColumn, TransferSpeedColumn
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.live import Live
+from rich.text import Text
+import time
+import threading
+
+piece_index = 0
+
+class RichBitTorrentDisplay:
+    def __init__(self):
+        self.console = Console()
+        self.progress = Progress(
+            TextColumn("[bold blue]{task.fields[filename]}", justify="left"),
+            BarColumn(bar_width=None),
+            "[progress.percentage]{task.percentage:>3.1f}%",
+            "•",
+            FileSizeColumn(),
+            "•",
+            TotalFileSizeColumn(),
+            console=self.console,
+            expand=True
+        )
+        self.task_id = None
+        self.peers_data = []
+        self.stats = {
+            'downloaded': 0,
+            'uploaded': 0,
+            'download_speed': 0,
+            'upload_speed': 0,
+            'active_peers': 0,
+            'total_peers': 0,
+            'pieces_completed': 0,
+            'total_pieces': 0,
+            'connected_time': 0
+        }
+        
+    def start_download(self, filename, total_size, total_pieces):
+        
+        self.task_id = self.progress.add_task(
+            "download", 
+            filename=filename,
+            total=total_size
+        )
+        self.stats['total_pieces'] = total_pieces
+        
+    def update_progress(self, downloaded_bytes):
+       
+        if self.task_id is not None:
+            self.progress.update(self.task_id, completed=downloaded_bytes)
+            self.stats['downloaded'] = downloaded_bytes
+    
+    def update_peers(self, peers_list):
+     
+        self.peers_data = []
+        active_count = 0
+        
+        for peer in peers_list:
+            if hasattr(peer, 'connected') and peer.connected:
+                active_count += 1
+                self.peers_data.append({
+                    'ip': peer.ip,
+                    'port': peer.port,
+                    'status': 'Connected' if peer.connected else 'Disconnected',
+                    'download_speed': getattr(peer, 'download_speed', 0),
+                    'upload_speed': getattr(peer, 'upload_speed', 0),
+                    'pieces': getattr(peer, 'pieces_count', 0)
+                })
+        
+        self.stats['active_peers'] = active_count
+        self.stats['total_peers'] = len(peers_list)
+    
+    def update_pieces(self, completed_pieces):
+    
+        self.stats['pieces_completed'] = completed_pieces
+    
+    def create_stats_panel(self):
+       
+        stats_table = Table(show_header=False, box=None, padding=(0, 1))
+        stats_table.add_column("Stat", style="cyan", width=15)
+        stats_table.add_column("Value", style="white")
+        
+      
+        dl_speed = f"{self.stats['download_speed'] / 1024 / 1024:.2f} MB/s" if self.stats['download_speed'] > 0 else "0 MB/s"
+        ul_speed = f"{self.stats['upload_speed'] / 1024 / 1024:.2f} MB/s" if self.stats['upload_speed'] > 0 else "0 MB/s"
+        
+      
+        downloaded_mb = self.stats['downloaded'] / 1024 / 1024
+        
+        stats_table.add_row("Downloaded:", f"{downloaded_mb:.2f} MB")
+        stats_table.add_row("Active Peers:", f"[bold]{self.stats['active_peers']}/{self.stats['total_peers']}[/bold]")
+        stats_table.add_row("Pieces:", f"{self.stats['pieces_completed']}/{self.stats['total_pieces']}")
+        
+      
+        if self.stats['active_peers'] > 0:
+            connection_status = "🟢 Good" if self.stats['active_peers'] >= 10 else "🟡 Fair" if self.stats['active_peers'] >= 5 else "🔴 Poor"
+            stats_table.add_row("Connection:", connection_status)
+        
+        return Panel(stats_table, title="[bold cyan]Statistics[/bold cyan]", border_style="blue")
+    
+    def create_peers_panel(self):
+     
+        if not self.peers_data:
+            return Panel("[dim]No active peers[/dim]", title="[bold green]Active Peers[/bold green]", border_style="green")
+        
+        peers_table = Table(show_header=True, header_style="bold magenta")
+        peers_table.add_column("IP:Port", width=21)
+        peers_table.add_column("Status", width=12)
+        peers_table.add_column("Connected", width=12)
+        
+       
+        for i, peer in enumerate(self.peers_data[:15]):
+            status_color = "green" if peer['status'] == "Connected" else "red"
+           
+            connected_time = getattr(peer, 'connected_time', 'Unknown')
+            
+            peers_table.add_row(
+                f"{peer['ip']}:{peer['port']}",
+                f"[{status_color}]{peer['status']}[/{status_color}]",
+                f"[dim]{connected_time}[/dim]"
+            )
+        
+        title = f"[bold green]Active Peers ({len(self.peers_data)})[/bold green]"
+        return Panel(peers_table, title=title, border_style="green")
+    
+    def create_layout(self):
+        
+        layout = Layout()
+        
+        layout.split(
+            Layout(name="progress", size=3),
+            Layout(name="main"),
+        )
+        
+        layout["main"].split_row(
+            Layout(name="stats", ratio=1),
+            Layout(name="peers", ratio=2),
+        )
+        
+        layout["progress"].update(self.progress)
+        layout["stats"].update(self.create_stats_panel())
+        layout["peers"].update(self.create_peers_panel())
+        
+        return layout
+    
+    def display_header(self):
+       
+        header = Text.assemble(
+            ("🚀 ", "bold red"),
+            ("Custom BitTorrent Client", "bold cyan"),
+            (" 🚀", "bold red")
+        )
+        self.console.print(Panel(header, style="bold blue"))
+    
+    def log_message(self, message, style="white"):
+      
+        self.console.print(f"[{style}]• {message}[/{style}]")
+
 
 class TorrentFile:
     
@@ -276,8 +436,10 @@ class PieceManager:
                 del self.piece_blocks[piece_index]
         
         print(f"✓ Downloaded and verified piece {piece_index + 1}/{self.torrent.num_pieces}")
+
         return True
-    
+
+
     def release_piece(self, piece_index: int):
        
         with self.lock:
@@ -372,45 +534,7 @@ class TrackerClient:
         else:
             print(f"Unsupported tracker protocol: {announce_url}")
             return []
-    
-    def _get_peers_http(self, announce_url: str) -> List[Tuple[str, int]]:
         
-        params = {
-            'info_hash': self.torrent.info_hash,
-            'peer_id': self.peer_id,
-            'port': 6881,
-            'uploaded': 0,
-            'downloaded': 0,
-            'left': self.torrent.total_length,
-            'compact': 1,
-            'event': 'started'
-        }
-        
-      
-        encoded_params = []
-        for key, value in params.items():
-            if isinstance(value, bytes):
-                encoded_params.append(f"{key}={urllib.parse.quote(value)}")
-            else:
-                encoded_params.append(f"{key}={value}")
-        
-        url = f"{announce_url}?{'&'.join(encoded_params)}"
-        
-        try:
-            response = urllib.request.urlopen(url, timeout=10)
-            data = bencodepy.decode(response.read())
-            
-            if b'failure reason' in data:
-                print(f"Tracker error: {data[b'failure reason'].decode()}")
-                return []
-            
-            peers_data = data[b'peers']
-            return self._parse_peers(peers_data)
-            
-        except Exception as e:
-            print(f"Failed to contact HTTP tracker: {e}")
-            return []
-    
     def _get_peers_udp(self, announce_url: str) -> List[Tuple[str, int]]:
        
         try:
@@ -521,13 +645,14 @@ class TorrentClient:
         self.running = False
         
     def start_download(self):
+        print("Torrent total lengh", self.torrent.total_length)
         
-        print(f"Starting download of: {self.torrent.name}")
+        '''print(f"Starting download of: {self.torrent.name}")
         print(f"Total size: {self.torrent.total_length} bytes ({self.torrent.total_length / (1024*1024*1024):.2f} GB)")
         print(f"Number of pieces: {self.torrent.num_pieces}")
         print(f"Piece size: {self.torrent.piece_length} bytes ({self.torrent.piece_length / 1024:.0f} KB)")
         print(f"Number of files: {len(self.torrent.files)}")
-        print(f"Info hash: {self.torrent.info_hash.hex()}")
+        print(f"Info hash: {self.torrent.info_hash.hex()}")'''
         
        
         self.file_manager.create_files()
@@ -538,12 +663,12 @@ class TorrentClient:
             print("No peers available")
             return
         
-        print(f"Found {len(peer_list)} peers")
+        '''print(f"Found {len(peer_list)} peers")'''
         
       
-        print("Sample peers:")
+        '''print("Sample peers:")
         for i, (ip, port) in enumerate(peer_list[:5]):
-            print(f"  {ip}:{port}")
+            print(f"  {ip}:{port}")'''
         
        
         for ip, port in peer_list:
@@ -565,7 +690,7 @@ class TorrentClient:
             thread.start()
             time.sleep(0.1) 
         
-        print(f"Started connection attempts to {attempted_count} peers")
+        '''print(f"Started connection attempts to {attempted_count} peers")'''
         
        
         time.sleep(3)
@@ -576,46 +701,61 @@ class TorrentClient:
         target_peers = 50
         max_peers = 100
         
-        while self.running and not self.piece_manager.is_complete():
-            time.sleep(1.1)
-            progress = self.piece_manager.get_progress()
-            active_peers = sum(1 for peer in self.peers if peer.connected)
-            
-            print(f"Progress: {progress:.1f}% ({active_peers} active peers)") 
-            
+        display = RichBitTorrentDisplay()
+        display.display_header()
+        display.start_download(self.torrent.name, self.torrent.total_length, self.torrent.num_pieces)
         
-          
-            if active_peers < target_peers and attempted_count < len(self.peers):
-                peers_to_add = min(target_peers - active_peers, 10)
-                peers_to_add = max(peers_to_add, 0) 
+        with Live(display.create_layout(), refresh_per_second=2, console=display.console) as live:
+            while self.running and not self.piece_manager.is_complete():
+                time.sleep(1.1)
+                progress = self.piece_manager.get_progress()
+                active_peers = sum(1 for peer in self.peers if peer.connected)
                 
-                if peers_to_add > 0:
-                    print(f"Adding {peers_to_add} more peers...")
-                    for i in range(peers_to_add):
-                        if attempted_count < len(self.peers):
-                            peer = self.peers[attempted_count]
-                            if not peer.connected:
-                                thread = threading.Thread(target=self._connect_and_handle_peer, args=(peer,))
-                                thread.daemon = True
-                                thread.start()
-                                time.sleep(0.05)
-                            attempted_count += 1
+                print(f"Progress: {progress:.1f}% ({active_peers} active peers)") 
+                
+            
+            
+                if active_peers < target_peers and attempted_count < len(self.peers):
+                    peers_to_add = min(target_peers - active_peers, 10)
+                    peers_to_add = max(peers_to_add, 0) 
+                    
+                    if peers_to_add > 0:
+                        print(f"Adding {peers_to_add} more peers...")
+                        for i in range(peers_to_add):
+                            if attempted_count < len(self.peers):
+                                peer = self.peers[attempted_count]
+                                if not peer.connected:
+                                    thread = threading.Thread(target=self._connect_and_handle_peer, args=(peer,))
+                                    thread.daemon = True
+                                    thread.start()
+                                    time.sleep(0.05)
+                                attempted_count += 1
 
-            if progress == last_progress:
-                stall_count += 1
-                if stall_count > 5:
-                    target_peers = min(target_peers + 10, max_peers)
-                else:
-                    stall_count = 0
-                    last_progress = progress    
+                if progress == last_progress:
+                    stall_count += 1
+                    if stall_count > 5:
+                        target_peers = min(target_peers + 10, max_peers)
+                    else:
+                        stall_count = 0
+                        last_progress = progress    
+
+                progress = self.piece_manager.get_progress()
+                downloaded_bytes = int((progress / 100) * self.torrent.total_length)
+                display.update_progress(downloaded_bytes)
+                display.update_peers(self.peers)
+                display.update_pieces(piece_index)
+            
                 
-        
-        if self.piece_manager.is_complete():
-            print("Download completed!")
-        else:
-            print("Download stopped")
-        
-        self.running = False
+                live.update(display.create_layout())
+                
+                time.sleep(1)    
+            
+            if self.piece_manager.is_complete():
+                print("Download completed!")
+            else:
+                print("Download stopped")
+            
+            self.running = False
     
     def _connect_and_handle_peer(self, peer: Peer):
       
@@ -683,7 +823,6 @@ class TorrentClient:
                         
                             if self.piece_manager.store_piece(piece_index, complete_piece_data):
                                 self.file_manager.write_piece_data(piece_index, complete_piece_data)
-                                print(f"Successfully completed piece {piece_index}")
                                 
                                
                                 if current_piece == piece_index:
